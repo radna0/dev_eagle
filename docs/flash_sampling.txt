@@ -1,0 +1,2231 @@
+Under review as a conference paper at ICLR 2025
+
+000
+001
+002
+003
+004
+005
+006
+007
+
+F LASH S AMPLING : FAST AND M EMORY-E FFICIENT
+E XACT S AMPLING WITH G ROUP -G UMBEL -M AX
+Anonymous authors
+Paper under double-blind review
+
+008
+009
+010
+011
+012
+013
+
+A BSTRACT
+Sampling operations in discrete space are widely used in different fields such
+as language models, reinforcement learning, VAE, GAN, and neural architecture search. Current sampling methods involve computing the softmax operation
+across the entire categories, leading to significant computational and memory requirements, particularly when dealing with large sampling categories. This paper
+presents a novel sampling approach known as FlashSampling, designed to alleviate the computational and communication overhead by circumventing the computation of the softmax operation. Our method maintains mathematical equivalence
+to conventional sampling strategies while demonstrating significantly enhanced
+speed and memory efficiency. This is achieved by partitioning the category into
+distinct groups for independent sampling and then leveraging the Gumble-Max
+trick to eliminate the need for softmax computation. We substantiate the correctness and efficacy of our method both through mathematical proofs and empirical
+validation. Extensive experimental outcomes illustrate marked enhancements in
+speed and memory utilization, with FlashSampling attaining up to 384% faster
+sampling times and 1822% reduced memory consumption.
+
+014
+015
+016
+017
+018
+019
+020
+021
+022
+023
+024
+025
+026
+027
+028
+029
+030
+031
+032
+033
+034
+035
+036
+037
+038
+039
+040
+041
+042
+043
+044
+045
+046
+047
+048
+049
+050
+051
+052
+053
+
+1
+
+I NTRODUCTION
+
+Sampling in discrete spaces is fundamental to a wide array of machine learning domains, including
+language modeling (Brown et al., 2020), reinforcement learning (Mnih et al., 2013), variational
+autoencoders (VAE) (van den Oord et al., 2017), generative adversarial networks (GAN) (Yu et al.,
+2016), and neural architecture search (Zoph & Le, 2017). In language models, discrete sampling is
+indispensable for generating coherent and contextually relevant text by selecting words from a vast
+vocabulary Sutskever (2014). Reinforcement learning algorithms rely on sampling actions from
+policy distributions to explore and learn optimal strategies within complex environments Mnih et al.
+(2015). VAEs and GANs employ sampling techniques to generate new data instances from learned
+latent spaces, facilitating tasks like image synthesis and data augmentation van den Oord et al.
+(2017); Yu et al. (2016). Neural architecture search utilizes sampling to efficiently explore a vast
+space of possible network architectures, aiming to discover models with superior performance while
+minimizing computational resources (Zoph & Le, 2017).
+Typically, sampling from a categorical distribution involves computing the Softmax function to obtain probabilities over all possible categories. As the number of categories increases, this approach
+becomes computationally intensive and memory-demanding due to the need to calculate the Softmax
+denominator and store the full set of probabilities for multinomial sampling. The complexity poses
+challenges, particularly in auto-regressive architectures where each token is sequentially generated
+based on previously produced tokens (Brown et al., 2020). While numerous acceleration algorithms
+have been developed for continuous space sampling in diffusion models (Neal, 2012; Hoffman et al.,
+2014; Tucker et al., 2017; Grathwohl et al., 2017; CORNUET et al., 2012), discrete space sampling
+remains relatively under-explored (Jang et al., 2016; Kool et al., 2019).
+The mainstream method still involves first using Softmax to compute probabilities and then performing sampling. These challenges highlight the necessity for more efficient sampling techniques
+that can bypass the computational bottlenecks of the Softmax operation, reduce storage overhead,
+and maintain mathematical correctness and performance. This raises the question: can we address
+1
+
+Under review as a conference paper at ICLR 2025
+
+054
+055
+
+𝑮𝒖𝒎𝒃𝒆𝒍 − 𝑴𝒂𝒙
+𝑮𝒖𝒎𝒃𝒆𝒍 − 𝑴𝒂𝒙
+
+056
+057
+058
+059
+060
+061
+062
+063
+064
+065
+066
+067
+068
+069
+070
+071
+072
+073
+074
+075
+076
+077
+078
+079
+080
+081
+082
+083
+084
+085
+086
+087
+088
+089
+090
+091
+092
+093
+094
+095
+096
+097
+098
+099
+100
+101
+102
+103
+104
+105
+106
+107
+
+𝒛
+
+𝒛
+
+𝒑
+
+𝒛, 𝒍
+
+𝒛𝟎 , 𝒍𝟎
+
+𝑺𝒐𝒇𝒕𝒎𝒂𝒙
+
+𝒛𝟏, 𝒍𝟏
+
+⋯
+
+𝒛𝒎−𝟏 , 𝒍𝒎−𝟏
+
+𝒚𝟎
+
+𝒚𝟏
+
+𝒚
+𝒙
+⊗
+
+𝑾𝟎
+
+𝑾
+
+Naive Sampling
+
+𝒛𝒌, 𝒍𝒌
+𝑮𝒖𝒎𝒃𝒆𝒍 − 𝑴𝒂𝒙
+
+𝑮𝒖𝒎𝒃𝒆𝒍 − 𝑴𝒂𝒙
+
+𝒙
+
+𝒛, 𝒍
+
+⋯
+
+𝒙
+𝑋
+
+⊗
+𝑾𝟏
+
+𝒚𝒌
+
+𝒚𝒎−𝟏
+
+⋯
+
+𝑾
+
+𝑾𝒎−𝟏
+
+⊗
+
+𝑊0
+
+𝑾𝟏
+
+loop over 𝒌 dim
+
+⋯
+
+𝑊𝑚−1
+
+𝑾
+
+FlashSampling (Parallel)
+
+FlashSampling (Sequential)
+
+Figure 1: Operational illustration of FlashSampling. From left to right: naive sampling, FlashSampling(parallel), and FlashSampling(sequential) using online computing. x ∈ Rd denotes embedding, W ∈ Rd×V denotes category projection matrix, y denotes logits, p denotes probability, z
+denotes the sampling result and l denotes the intermediate variables in the FlashSampling process.
+both computational and memory issues simultaneously while performing accurate multinomial sampling?
+In this paper, we introduce the FlashSampling algorithm, an exact sampling method to sample categorical distribution that simultaneously addresses both computational efficiency and memory overhead issues. To tackle the first issue—the significant computational burden of calculating the Softmax denominator—we employ the Gumbel-Max trick (Jang et al., 2016) This technique allows us
+to sample from categorical distribution using only the logits (the values before applying Softmax),
+eliminating the need to compute the Softmax function. To resolve the second issue of substantial
+memory requirements, we implement a two-stage group sampling strategy. In the first stage, we
+conduct intra-group sampling within each group; in stage two, we perform inter-group sampling on
+the candidates selected from each group. This approach reduces the storage complexity from O(V )
+to O(V /g) in the parallel version or even to O(g) in the sequential version, where V is the category
+size and g is the number of groups. FlashSampling can be easily extended to a distributed version,
+where the communication overhead is reduced to O(1). This significant reduction in communication
+cost, independent of the category size, makes it highly efficient for distributed settings.
+We validated the effectiveness of FlashSampling across various scenarios, including speed and memory tests as well as generation quality tests. Specifically, we conducted standalone tests (focusing
+solely on the sampling function) and end-to-end tests (LLM inference) to compare FlashSampling
+with the baseline in terms of speed and memory consumption. Additionally, in the end-to-end tests,
+we evaluated the generation quality of FlashSampling against the baseline. FlashSampling demonstrated faster performance, lower memory consumption, and comparable generation quality to the
+baseline.
+
+2
+
+R ELATED WORK
+
+2.1
+
+S AMPLING IN D EEP -L EARNING
+
+Sampling in Contiguous Space. Various statistical methods have been developed to improve sampling from continuous distributions. Building upon the foundation of Markov Chain Monte Carlo
+(MCMC) (Gamerman & Lopes, 2006), advanced techniques such as Hamiltonian Monte Carlo
+(HMC) Neal (2012) and the No-U-Turn Sampler (NUTS) Hoffman et al. (2014) enhance convergence and efficiency by leveraging gradient information and adaptively adjusting path lengths during
+sampling. For large-scale datasets, methods like Stochastic Gradient Langevin Dynamics (SGLD)
+Welling & Teh (2011) and Stochastic Gradient Hamiltonian Monte Carlo (SGHMC) Chen et al.
+(2014) reduce computational overhead by incorporating stochastic gradients and mini-batch data
+while still capturing model uncertainty.
+Sampling in Discrete Space. Optimizing sampling for discrete variables and categorical distributions presents significant challenges due to the absence of gradient information. To tackle these
+2
+
+𝒛
+
+Under review as a conference paper at ICLR 2025
+
+108
+109
+110
+111
+112
+113
+114
+115
+116
+117
+118
+119
+120
+121
+122
+123
+124
+125
+126
+127
+128
+129
+130
+131
+132
+133
+134
+135
+136
+137
+138
+139
+140
+141
+142
+143
+144
+145
+146
+147
+148
+149
+150
+151
+152
+153
+154
+155
+156
+157
+158
+159
+160
+161
+
+challenges, methods such as Sequential Monte Carlo (SMC) Doucet (2001), Particle Gibbs sampling
+Andrieu et al. (2010), REBAR Tucker et al. (2017), and RELAX Grathwohl et al. (2017) have been
+developed. These methods aim to improve computational efficiency, reduce variance, and enable
+gradient-based optimization in models with discrete variables. Additionally, Adaptive Importance
+Sampling CORNUET et al. (2012) and enhanced categorical rejection sampling methods Neumann
+(1951); Efraimidis (2015) increase efficiency by adjusting proposal distributions and optimizing
+acceptance probabilities, particularly when dealing with high-dimensional categorical data. The
+Gumbel-Max trick Jang et al. (2016) is another effective technique for sampling from categorical
+distributions. It transforms the sampling process into a maximization problem by adding Gumbel
+noise to the log probabilities of the categories and selecting the category with the maximum perturbed value. This approach is particularly useful for discrete latent variable models in variational
+inference. Parallelization strategies such as Parallel Tempering and Replica Exchange MCMC Earl
+& Deem (2005) enhance exploration efficiency by running multiple chains at different temperatures in parallel. Furthermore, Variational Inference (VI) Blei et al. (2017) transforms the sampling
+problem into an optimization task, providing faster convergence with some bias. Collectively, these
+methods significantly enhance the practicality and scalability of sampling in deep learning.
+2.2
+
+M EMORY-E FFICIENT M ETHOD
+
+Memory-efficient methods are extensively employed in attention computation, which is computationally intensive and involves significant memory I/O operations. Online softmax approach (Rabe
+& Staats, 2021) is introduced to efficiently compute numerically stable attention scores sequentially
+while maintaining linear memory usage. To address time and memory consumption during training,
+FlashAttention (Dao et al., 2022; Dao, 2023) utilizes tiling strategies to minimize memory reads and
+writes between the GPU’s high-bandwidth memory (HBM) and on-chip SRAM. xFormers also introduces a similar technique (Lefaudeux et al., 2022). PagedAttention (Kwon et al., 2023) optimizes
+the use of the KV cache memory by reducing waste and enabling adaptive sharing among batched
+requests during inference. Furthermore, similar grouping and tiling approaches are used by techniques such as Lightning Attention (Qin et al., 2024) and Flash Linear Attention (Yang et al., 2023;
+2024; Zhang et al., 2024) to optimize GPU memory consumption in linear-complexity attention
+mechanisms.
+
+3
+
+M ETHOD
+
+Algorithm 1 FlashSampling(Parallel)
+d
+
+d×V
+
+Input: x ∈ R , W ∈ R
+, group size g,
+flag.
+Divide W into m = n/g blocks
+W0 , W1 , ...Wm−1 of size d × g each.
+Compute yk = Wk⊤ x ∈ Rg , k =
+0, . . . , m − 1.
+Sample
+zk = arg max ykj − log(− log ukj ),
+
+Algorithm 2 Flash Sampling(Sequential)
+Input: x ∈ Rd , W ∈ Rd×V , group size g,flag.
+Divide W into m = ng blocks W0 , W1 , ...Wm−1 of size
+d × g each.
+Initialize l = −∞, z = 0.
+for k = 0, . . . , m − 1 do
+yk = Wk⊤ x ∈ Rg .
+Sample
+zk = arg max ykj − log(− log ukj ),
+j
+
+j
+
+i.i.d.
+
+ukj ∼ U (0, 1).
+lk = lse(yk ).
+¯
+l = [l, lk ].
+Sample
+ik = arg max ¯
+lj − log(− log ūj ),
+
+i.i.d.
+
+ukj ∼ U (0, 1).
+Sample
+i = arg max lk − log(− log ūk ),
+
+j
+
+k
+
+i.i.d.
+
+i.i.d.
+
+ūj ∼ U (0, 1).
+
+ūk ∼ U (0, 1).
+if flag then
+l = lse([l0 , . . . , lm−1 ]).
+else
+l = −∞.
+end if
+Return z = zi , l.
+
+z = [z, zk ]ik .
+l = lse(¯
+l).
+end for
+if not flag then
+l = −∞.
+end if
+Return z, l.
+.
+
+3
+
+Under review as a conference paper at ICLR 2025
+
+162
+163
+164
+165
+166
+167
+168
+169
+170
+171
+172
+173
+174
+175
+176
+177
+178
+179
+180
+181
+182
+183
+184
+185
+186
+187
+188
+189
+190
+191
+192
+193
+194
+195
+196
+197
+198
+199
+200
+201
+202
+203
+204
+205
+206
+207
+208
+209
+210
+211
+212
+213
+214
+215
+
+In this section, we’ll explore sampling categorical distribution in deep learning and introduce our
+proposed method FlashSampling using the Group-Gumbel-Max trick. We’ll examine its parallel,
+sequential, and distributed implementations.
+In the following discussion, we assume d represents the number of features, V represents the number of categories, x ∈ Rd denotes a column vector, and W denotes a matrix. We use C(p) to
+PV −1
+represent a Categorical distribution, where p ∈ RV and j=0 pj = 1. We use lse to represent the
+P
+
+‘LogSumExp‘ function, defined as lse(x) = log
+j exp(xj ) .
+3.1
+
+S AMPLING CATEGORICAL DISTRIBUTIONS IN D EEP L EARNING
+
+In deep learning, sampling categorical distributions is typically performed through the following steps:
+first, we obtain features x ∈ Rd and
+a categorical projection Wd×V from
+the neural network. Using matrix
+multiplication, we compute the logits y = W⊤ x ∈ RV . Then, the
+‘Softmax‘ function is applied to compute the probability distribution p =
+Softmax(y), and finally, sampling is
+performed.
+
+Algorithm 3 FlashSampling(Distrubuted)
+Input: x ∈ Rd , W ∈ Rd×V , distributed world size n, group
+size g.
+Divide W into n blocks W0 , W1 , ...Wn−1 of size d×(V /n)
+each.
+zk , lk = flash sampling(x, Wk , g, True).
+z, l = 0 ∈ Rn .
+Gather(zk , z, dst = 0).
+Gather(lk , l, dst = 0).
+On rank0, sample i = arg maxk lk − log(− log uk ), k =
+0, . . . , n − 1.
+Return zi .
+
+From the above process, it is clear
+that in deep learning, before sam- Algorithm 4 Gumbel-Max sampling
+pling, we need to compute the probInput: x ∈ Rd , W ∈ Rd×V .
+ability distribution using ‘Softmax‘
+Compute y = W⊤ x ∈ RV .
+and store it. This differs from typi.i.d.
+Compute zk = yk − log(− log uk ), uk ∼ U (0, 1), k =
+ical sampling categorical distribu0, . . . , V − 1.
+tions scenarios, where we are directly
+Return z = arg maxk zk .
+given the probability distribution p =
+(p0 , . . . , pV −1 ), and there is no need to compute p.
+This approach poses two main issues when the category size is large:
+• Computing the probability requires computing the Softmax function, which introduces significant computational overhead.
+• The need to store the probability distribution p to perform sampling, leads to a high memory demand.
+These challenges lead us to the following question: Can we address both of these issues and still
+perform accurate sampling from Categorical distribution? In the following subsections, we will
+discuss how to solve these two problems.
+3.2
+3.2.1
+
+F LASH S AMPLING WITH G ROUP -G UMBEL -M AX
+U SING G UMBEL -M AX TO AVOID C OMPUTING S OFTMAX
+
+Our first optimization is to use the Gumbel-Max (Jang et al., 2016) trick to avoid computing Softmax.
+Sampling z ∼ C(p) is equivalent to:
+z = arg max [log pk − log(− log uk )] ,
+k
+
+i.i.d.
+
+uk ∼ U (0, 1)
+
+(1)
+
+where U (0, 1) represents the uniform distribution over (0, 1), and i.i.d. stands for independent and
+identically distributed.
+4
+
+Under review as a conference paper at ICLR 2025
+
+216
+217
+
+k)
+Substituting pk = Pexp(y
+exp(yj ) into the equation, we get:
+j
+
+218
+219
+220
+221
+222
+223
+224
+225
+226
+227
+228
+229
+230
+231
+232
+233
+234
+235
+236
+237
+238
+239
+240
+241
+242
+243
+244
+245
+246
+247
+248
+249
+250
+251
+252
+253
+254
+255
+256
+257
+258
+259
+260
+261
+262
+263
+264
+265
+266
+267
+268
+269
+
+z = arg max [log pk − log(− log uk )]
+k
+
+
+
+
+X
+= arg max log exp(yk ) − log 
+exp(yj ) − log(− log uk )
+k
+
+(2)
+
+j
+
+= arg max [yk − lse(y) − log(− log uk )]
+k
+
+= arg max [yk − log(− log uk )] ,
+k
+
+i.i.d.
+
+uk ∼ U (0, 1).
+
+We summarize this in the following proposition:
+Proposition 3.1. Sampling z ∼ C(p) is equivalent to:
+z = arg max [yk − log(− log uk )] ,
+k
+
+i.i.d.
+
+uk ∼ U (0, 1).
+
+By using this proposition, we can perform sampling without needing to compute the Softmax function, although we still need to calculate the complete logits.
+3.2.2
+
+U SE G ROUP T ECHNIQUE TO AVOID M ATERIALIZING L OGITS
+
+The second optimization is based on the following fact:
+P
+exp(xk )
+exp(xk )
+j∈A exp(xj )
+=P
+· P
+.
+pk = P
+j exp(xj )
+j∈A exp(xj )
+j exp(xj )
+where A is any subset that contains k. The intuitive meaning of this equation is that sampling
+from category distribution can be decomposed into two steps: first, sampling a subset A, and then
+sampling within subset A. Based on this fact, we present the following proposition:
+Proposition 3.1.1. Given a Categorical distribution C(p) and group size g, sampling from C(p) is
+equivalent to sampling zk from C(pk ), k = 1, . . . , V /g − 1, sampling index i from C(p̄), and give
+zi as the result. Where
+pkj = ekj /ek , p̄k = ek /e,
+X
+X
+ekj = exp(yAkj ), ek =
+exp(yj ), e =
+ej , pkj = ekj /e,
+j∈Ak
+
+k
+
+Ak = {kg, . . . , (k + 1)g − 1}, Akj = kg + j, k = 0, . . . , V /g − 1, j = 0, . . . , g − 1.
+If the process of sampling zk from C(pk ) is done in parallel, we obtain a parallel algorithm 5. If
+done sequentially, we obtain a sequential algorithm 6. The proof of correctness for the sequential
+version is as follows:
+Proof of Algorithm 6.
+V /g−1
+
+P(z = Akj ) = P(zk = Akj ) · P(ik = 1)
+
+Y
+
+P(is = 0)
+
+s=k+1
+V /g−1 P
+Y
+ekj
+ek
+ekj ek
+ekj
+t≤s−1 et
+P
+=
+·P
+=
+·
+=
+.
+ek
+e
+e
+e
+e
+e
+s
+t
+k
+s≤k
+t≤s
+
+(3)
+
+s=k+1
+
+Algorithm 5, 6 allows for efficient sampling without materializing the complete distribution, reducing memory requirements.
+5
+
+Under review as a conference paper at ICLR 2025
+
+270
+271
+272
+273
+274
+275
+276
+277
+278
+279
+280
+281
+282
+283
+284
+285
+286
+287
+288
+289
+290
+291
+292
+293
+294
+
+Algorithm 5 Group Softmax Sampling (Par.)
+
+Algorithm 6 Group Softmax Sampling (Seq.)
+
+Input: x ∈ Rd , W ∈ Rd×V , group size g.
+Divide
+W into m = ng blocks W0 , W1 , ...Wm−1 of size
+d × g each.
+Compute
+yk = Wk⊤ x ∈ Rg , k = 0, . . . , m − 1.
+Compute
+P
+P
+ekj = exp(ykj ), ek = j ekj , e = k ek .
+Compute
+pkj
+=
+ekj /ek , p̄k
+=
+ek /e, pk
+=
+(pk0 , . . . , pk,g−1 ), p̄ = (p̄0 , . . . , p̄m−1 ), k =
+0, . . . , m − 1, j = 0, . . . , g − 1.
+Sample
+zk ∼ C (pk ), k = 0, . . . , m − 1.
+Sample i ∼ C (p̄).
+Return z = zi .
+
+3.3
+
+Input: x ∈ Rd , W ∈ Rd×V ,group size g.
+Divide W into m = ng blocks W0 , W1 , ...Wm−1
+of size d × g each.
+Initialize l = −∞, z = 0.
+for k = 0, . . . , m − 1 do
+yk = Wk⊤ x ∈ Rg .
+lk = lse(yk ).
+pk = exp(yk )/ exp(lk ).
+Sample zk ∼ C(p).
+lk′ = lse([l, lk ]).
+p̄k = [exp(l)/ exp(lk′ ), exp(lk )/ exp(lk′ )].
+Sample ik ∼ C(p̄k ).
+z = [z, zk ]ik .
+l = lk′ .
+end for
+Return z.
+
+P UT EVERY THING TOGETHER
+
+It is important to note that in the previous section, both pk and p̄ are categorical distributions,
+allowing us to apply the Gumbel-Max trick. By combining the two previously mentioned tricks, we
+can derive FlashSampling(parallel) and FlashSampling(sequential). The complete algorithms are
+detailed in Algorithm 1, 2.
+3.4
+
+E XTENSION : D ISTRIBUTED V ERSION
+
+Scalability is becoming increasingly important, and FlashSampling naturally extends to a distributed
+version.
+
+295
+296
+297
+298
+299
+300
+
+Let’s first describe the traditional distributed sampling method: Suppose the number of categories
+is V , W is the category projection matrix, x is the embedding, and the distributed world size is
+n. In traditional distributed sampling, GPU with rank k stores a slice of the weight matrix Wk =
+W[:, k × V /n : (k + 1) × V /n], k = 0, . . . , n − 1. Each GPU with rank k computes its logits yk
+independently, followed by a ‘gather‘ operation where the logits are gathered to rank 0. Rank 0 then
+performs the categorical sampling. The PyTorch-like code for this process is as follows:
+
+301
+302
+303
+304
+305
+306
+
+def dist_sample(x, W):
+y = F.linear(x, W)
+y_array = [torch.empty_like(y) for _ in range(world_size)]
+dist.gather(y, gather_list=y_array)
+y = torch.cat(y_array, dim=-1)
+prob = F.softmax(y, dim=-1)
+
+307
+308
+309
+310
+311
+312
+313
+314
+315
+316
+317
+318
+319
+320
+321
+322
+323
+
+return torch.multinomial(prob, num_samples=1)
+
+As seen in the code, due to the need to communicate logits across GPUs, the communication complexity is O(V ), which results in significant communication overhead.
+By leveraging the Group Technique, we can first perform local sampling on each GPU and then
+communicate only the sampled results. Then, a sampling step can be performed to get the final
+result. The PyTorch-like code for this approach is as follows:
+def dist_sample(x, W):
+id, l = flash_sampling(x, W)
+id_array = [torch.empty_like(id) for _ in range(world_size)]
+l_array = [torch.empty_like(l) for _ in range(world_size)]
+dist.gather(id, gather_list=id_array)
+dist.gather(l, gather_list=l_array)
+id = torch.cat(id_array, dim=-1)
+l = torch.cat(l, dim=-1)
+output = gumbel_max_sampling(id, l)
+return output
+
+6
+
+Under review as a conference paper at ICLR 2025
+
+372
+373
+374
+375
+376
+377
+
+10000
+7500
+
+5000
+
+5000
+
+2500
+
+2500
+0
+
+16000
+14000
+
+16384
+
+32768
+
+65536
+
+131072
+
+262144
+
+12000
+Time(ms)
+
+524288
+
+Num Categories
+Num Categories Vs Time (Batch 2048, Dim 1024)
+Naive
+Flash(parallel)
+
+10000
+
+15000
+
+8000
+
+8192
+
+16384
+
+32768
+
+65536
+
+131072
+
+262144
+
+524288
+
+8192
+
+16384
+
+32768
+
+65536
+
+131072
+
+262144
+
+524288
+
+Num Categories
+Num Categories Vs Time (Batch 2048, Dim 2048)
+Naive
+Flash(parallel)
+
+12500
+
+6000
+
+1.37 x faster
+
+8192
+
+10000
+7500
+5000
+
+4000
+
+2500
+
+2000
+0
+
+0
+8192
+
+16384
+
+32768
+
+65536
+
+131072
+
+Num Categories
+
+262144
+
+524288
+
+Num Categories
+
+Here, l represents the local logit at each GPU, and the complete algorithm is outlined in Algorithm 3.
+Notice that with this method, the communication complexity is reduced to O(1), greatly improving
+communication efficiency.
+Table 1: Time Comparison of Naive Sampling, FlashSampling(Parallel), and FlashSampling(Sequential) across category Sizes (8K-512K) in 128 and 256 Dimensions. Dashes indicate
+out-of-memory errors, and times in the table are measured in seconds (s). The smaller the metric,
+the better.
+
+361
+362
+363
+364
+365
+366
+367
+368
+369
+370
+371
+
+12500
+
+0
+
+343
+344
+345
+346
+347
+348
+
+355
+356
+357
+358
+359
+360
+
+7500
+
+3.32 x faster
+
+10000
+
+338
+339
+340
+341
+342
+
+349
+350
+351
+352
+353
+354
+
+3.84 x faster
+Time(ms)
+
+12500
+
+2.17 x faster
+
+332
+333
+334
+335
+336
+337
+
+Time(ms)
+
+326
+327
+328
+329
+330
+331
+
+Figure 2: Time Comparison (measured in ms) of Naive and Parallel FlashSampling Across
+Sequence Lengths and Hidden Dimensions for Batch Size 2048. Each sub-figure represents the
+performance across hidden dimensions of 256, 512, 1024, and 2048. Dashed lines highlight where
+FlashSampling significantly surpasses Naive Sampling in time efficiency. The smaller the metric,
+the better.
+Num Categories Vs Time (Batch 2048, Dim 256)
+Num Categories Vs Time (Batch 2048, Dim 512)
+17500
+Naive
+Naive
+17500
+Flash(parallel)
+Flash(parallel)
+15000
+15000
+Time(ms)
+
+324
+325
+
+Method\Vocab.
+
+Dim
+
+8,192
+
+16,384
+
+32,768
+
+65,536
+
+131,072
+
+262,144
+
+524,288
+
+Naive
+Flash-Parallel
+Flash-Sequential
+
+128
+128
+128
+
+8.85
+2.50
+9.20
+
+17.19
+4.94
+18.40
+
+34.85
+9.94
+36.71
+
+71.03
+19.67
+72.62
+
+142.76
+39.67
+144.88
+
+78.68
+291.25
+
+157.61
+580.35
+
+Naive
+Flash-Parallel
+Flash-Sequential
+
+256
+256
+256
+
+10.18
+3.13
+10.17
+
+19.35
+6.23
+20.31
+
+39.18
+12.70
+40.73
+
+76.34
+25.20
+81.50
+
+150.67
+50.89
+163.27
+
+100.53
+326.06
+
+202.73
+647.98
+
+4
+
+E XPERITMENTS
+
+4.1
+
+FAST S AMPLING : S TANDALONE COMPARISON
+
+In this section, we present a detailed standalone test comparison among FlashSampling(parallel),
+FlashSampling(sequential), and Naive Sampling. We evaluate and contrast their performance by
+examining variations in speed and memory consumption across different numbers of category sizes
+and hidden dimensions. The detailed comparisons are vividly depicted in Fig. 2 and Fig. 3, with
+extensive details provided in Table 1 and Table 2.
+From the analysis of time and memory consumption illustrated in Fig. 2 and Fig. 3, it is evident
+that FlashSampling(parallel) achieves a speed up to 3.8 times faster than Naive Sampling and uses
+7
+
+Under review as a conference paper at ICLR 2025
+
+403
+404
+405
+406
+407
+408
+409
+410
+411
+412
+413
+414
+415
+416
+417
+418
+419
+420
+421
+422
+423
+424
+425
+426
+427
+428
+429
+430
+431
+
+2
+
+2
+
+16384
+
+32768
+
+65536
+
+131072
+
+262144
+
+524288
+
+Num Categories
+Num Categories Vs Memory (Batch 2048, Dim 1024)
+Naive
+Flash(parallel)
+
+5
+4
+3
+
+8192
+
+16384
+
+32768
+
+65536
+
+131072
+
+262144
+
+524288
+
+8192
+
+16384
+
+32768
+
+65536
+
+131072
+
+262144
+
+524288
+
+Num Categories
+Num Categories Vs Memory (Batch 2048, Dim 2048)
+Naive
+Flash(parallel)
+
+8
+7
+
+2
+
+6
+
+3.83 x smaller
+
+Memory(GB)
+
+3
+
+0
+
+8192
+
+6
+
+4
+
+1
+
+0
+
+7
+
+10.97 x smaller
+
+18.22 x smaller
+
+3
+
+1
+
+392
+393
+394
+395
+396
+397
+398
+399
+400
+401
+402
+
+Memory(GB)
+
+5
+
+4
+
+6.41 x smaller
+
+386
+387
+388
+389
+390
+391
+
+Memory(GB)
+
+380
+381
+382
+383
+384
+385
+
+Figure 3: Memory Consumption (measured in GB) of Naive and Parallel FlashSampling
+Across Sequence Lengths and Hidden Dimensions for Batch Size 2048. Each sub-figure represents the performance across hidden dimensions of 256, 512, 1024, and 2048. Dashed lines highlight
+where FlashSampling significantly surpasses Naive Sampling in memory efficiency. The smaller the
+metric, the better.
+Num Categories Vs Memory (Batch 2048, Dim 256)
+Num Categories Vs Memory (Batch 2048, Dim 512)
+Naive
+6
+Naive
+6
+Flash(parallel)
+Flash(parallel)
+5
+
+Memory(GB)
+
+378
+379
+
+5
+4
+3
+2
+
+1
+
+1
+
+0
+
+0
+8192
+
+16384
+
+32768
+
+65536
+
+131072
+
+262144
+
+524288
+
+Num Categories
+Num Categories
+Table 2: Memory Consumption of Naive Sampling, Parallel FlashSampling, and Sequential
+FlashSampling Across Vocabulary Sizes (8K-512K) in 128 and 256 Dimensions. Dashes indicate
+out-of-memory errors. Memory values in the table are measured in gigabytes (GB) and must not
+exceed 80GB. Lower values are preferred.
+Method\Vocab.
+
+Dim
+
+8,192
+
+16,384
+
+32,768
+
+65,536
+
+131,072
+
+262,144
+
+524,288
+
+Naive
+Flash-parallel
+Flash-sequential
+
+128
+128
+128
+
+3.07
+0.10
+0.07
+
+6.07
+0.13
+0.07
+
+12.08
+0.20
+0.08
+
+24.10
+0.34
+0.09
+
+48.13
+0.63
+0.13
+
+1.19
+0.19
+
+2.31
+0.31
+
+Naive
+Flash-parallel
+Flash-sequential
+
+256
+256
+256
+
+3.10
+0.13
+0.10
+
+6.11
+0.17
+0.11
+
+12.13
+0.25
+0.13
+
+24.16
+0.41
+0.16
+
+48.22
+0.72
+0.22
+
+1.34
+0.34
+
+2.59
+0.59
+
+only 1/18 of the memory. As detailed in Table 1 and Table 2, FlashSampling(sequential) is slightly
+slower than the baseline—within 10%—yet impressively consumes only 1% of the memory. Even
+when scaling cagetory sizes up to 512K, FlashSampling(sequential) maintains memory usage below
+1 GB. FlashSampling(parallel) consistently outperforms Naive Sampling by a significant margin.
+However, due to limited parallelism, FlashSampling(sequential) experiences a slowdown in calculations, which is slated for optimization in the upcoming version.
+4.2
+
+FAST S AMPLING : E ND - TO -E ND COMPARISON
+
+In this section, we delve into the outcomes of implementing FlashSampling for LLM inference on
+the LLaMA-8B-Insturct (Dubey et al., 2024), conducted within an 8 H100 GPU environment with
+tensor parallel size = 8 based on gpt-fast (Liang et al., 2024).
+In LLM inference, the ‘LmHead‘ layer typically employs tensor parallelism, which splits along the
+vocabulary dimension Kwon et al. (2023). For example, assuming a vocabulary size of 8k and a
+8
+
+Under review as a conference paper at ICLR 2025
+
+446
+447
+448
+449
+450
+451
+452
+453
+454
+455
+456
+457
+458
+459
+460
+461
+462
+463
+464
+465
+466
+467
+468
+
+Token Per Seconds
+
+1280
+1260
+1240
+1220
+
+2400
+
+2300
+
+2200
+
+2100
+
+1200
+
+512
+
+4600
+
+1024
+
+2048
+
+4096
+
+Sequence Length
+Token Per Seconds Vs Sequence Length (Batch 16)
+Naive
+Flash(distributed)
+
+4400
+
+8000
+
+Token Per Seconds
+
+440
+441
+442
+443
+444
+445
+
+Token Per Seconds
+
+434
+435
+436
+437
+438
+439
+
+Figure 4: Token per seconds (TPS) Comparison of Naive Sampling and FlashSampling(distributed) across sequence Lengths and Batch Sizes in LLaMA-8B. Each sub-figure
+displays performance for batch sizes of 4, 8, 16, and 32, with higher TPS values indicating better
+performance.
+Token Per Seconds Vs Sequence Length (Batch 4)
+Token Per Seconds Vs Sequence Length (Batch 8)
+Naive
+1320
+Naive
+2500
+Flash(distributed)
+Flash(distributed)
+1300
+
+Token Per Seconds
+
+432
+433
+
+4200
+4000
+3800
+3600
+3400
+
+7500
+
+512
+
+1024
+
+512
+
+1024
+
+2048
+
+4096
+
+2048
+
+4096
+
+Sequence Length
+Token Per Seconds Vs Sequence Length (Batch 32)
+Naive
+Flash(distributed)
+
+7000
+6500
+6000
+5500
+5000
+
+512
+
+1024
+
+2048
+
+Sequence Length
+
+4096
+
+Sequence Length
+
+weight matrix W ∈ Rd×8000 , with a tensor parallelism degree of 8 (and the same number of GPUs),
+GPU with rank k will have the weight matrix slice W[:, 1000k : 1000k + 1000].
+During sampling, each GPU (rank k) computes the logits for positions 1000k to 1000k + 1000, followed by a ‘gather‘ operation where GPU rank 0 gathers the complete logits and performs the sampling. Using FlashSampling (distributed), we have significantly minimized communication overhead, reducing it by a factor of 1000—or more specifically, V /num of tensor parallel size). The
+advantageous outcomes of this strategy are demonstrated in Fig. 4 and Fig. 5. It can be seen that
+FlashSampling (Distributed) significantly reduces memory usage while achieving faster speeds.
+4.3
+
+E MPIRICAL V ERIFICATION IN LLM
+
+469
+470
+471
+472
+473
+
+In this experiment, we compare the generation outcomes obtained using Vanilla Sampling and FlashSampling on LLaMA3-8B-Insturct. The prompt used for generating text was Hello, my name is.
+The results indicate that the outputs from the FlashSampling method are comparable to Vanilla
+Sampling, aligning with the theoretical analysis.
+
+474
+475
+476
+477
+478
+479
+
+Vanilla Sampling :
+
+480
+481
+482
+483
+484
+485
+
+<| begin of text |>Hello, my name is Somer. I wanted to share a little about my life . I ’m
+a busy individual with a full schedule of work, family and personal
+responsibilities . I love my pets and spending time with them. I also enjoy
+spending time in my garden and trying to grow my own herbs and vegetables . I have
+a huge passion for cooking and experimenting with new recipes . One of my favorite
+things to do is to try out new recipes on my friends and family and see the looks
+on their faces when they try something new and delicious . As for travel , I ’m an
+avid adventurer and love to explore new places . I ’ve been to many beautiful
+destinations and can’ t wait to add more to my list . My goal in life is to live a
+life of purpose and to help others , whether it be through my cooking, my
+gardening, or just simply being a good friend and family member. I believe that
+life is too short to waste time and I strive to make the most of every moment.
+9
+
+Under review as a conference paper at ICLR 2025
+
+500
+501
+502
+503
+504
+505
+506
+507
+508
+509
+510
+511
+512
+513
+514
+515
+516
+517
+518
+519
+520
+521
+522
+523
+524
+525
+526
+527
+528
+529
+530
+531
+532
+533
+534
+535
+536
+537
+538
+539
+
+Memory(GB)
+
+7
+
+Memory Vs Sequence Length (Batch 8)
+Naive
+Flash(distributed)
+
+12
+
+6
+5
+
+10
+
+8
+
+6
+
+4
+4
+
+512
+
+22.5
+20.0
+
+1024
+
+2048
+
+Sequence Length
+Memory Vs Sequence Length (Batch 16)
+Naive
+Flash(distributed)
+
+4096
+
+512
+
+Sequence Length
+Memory Vs Sequence Length (Batch 32)
+Naive
+Flash(distributed)
+
+2048
+
+4096
+
+512
+
+1024
+
+2048
+
+4096
+
+50
+
+40
+
+17.5
+
+Memory(GB)
+
+494
+495
+496
+497
+498
+499
+
+Memory Vs Sequence Length (Batch 4)
+Naive
+Flash(distributed)
+
+8
+
+Memory(GB)
+
+488
+489
+490
+491
+492
+493
+
+Figure 5: Memory consumption (measured in GB) of Naive Sampling and FlashSampling(Distributed) Across Sequence Lengths and Batch Sizes in LLaMA-8B. Each sub-figure
+displays performance for batch sizes of 4, 8, 16, and 32.
+
+Memory(GB)
+
+486
+487
+
+15.0
+12.5
+10.0
+
+1024
+
+30
+
+20
+
+7.5
+
+10
+
+5.0
+2.5
+
+512
+
+1024
+
+2048
+
+Sequence Length
+
+4096
+
+Sequence Length
+
+FlashSampling :
+<| begin of text |>Hello, my name is Somerotos. I am an artist and designer from Mexico.
+I am a bitpace artist , which means that I work with a mix of traditional and
+digital media. I lovekeleton and skeleton art , but I also enjoy working with other
+themes and styles . I am a bit of a recommend artist , and I am always looking for
+new ways to express myself and push the boundaries of what is possible with my
+art . I am excited to share my art with you and hope that you will enjoy it .\ nI am a
+bit of a creative person , and I love to experiment with different techniques and
+styles . I have been working as a artist for many years, and I have developed my
+own unique style and voice . I am a bit of a recommend artist , and I am always
+looking for new ways to express myself and push the boundaries of what is possible
+with my art .
+
+5
+
+C ONCLUSION
+
+In this paper, we have introduced FlashSampling, a novel sampling method designed to mitigate
+the computational and memory burdens of traditional softmax-based approaches in discrete spaces.
+By partitioning categories into distinct groups and leveraging the Gumbel-Max trick, FlashSampling circumvents the need for softmax computation while maintaining mathematical equivalence
+to conventional sampling strategies. Our method is substantiated by both mathematical proofs and
+empirical validations, demonstrating up to 384% faster sampling times and an impressive 1822%
+reduction in memory consumption. These significant enhancements underscore the potential of
+FlashSampling to optimize a wide array of applications—including language models, reinforcement
+learning, VAE, GAN, and neural architecture search—offering a more efficient alternative for future
+research and development.
+
+10
+
+Under review as a conference paper at ICLR 2025
+
+540
+541
+
+6
+
+542
+543
+544
+545
+546
+547
+
+This research presents FlashSampling, an algorithm designed to enhance computational efficiency
+and reduce memory usage in machine learning sampling tasks. By minimizing resource requirements, FlashSampling can decrease energy consumption and make advanced computational techniques more accessible. While we identify no direct ethical concerns with FlashSampling, we
+recognize the potential for misuse and encourage users to consider the wider societal and ethical
+impacts of their applications.
+
+548
+549
+550
+551
+552
+553
+554
+555
+556
+557
+558
+559
+560
+561
+562
+563
+564
+565
+566
+567
+568
+569
+570
+571
+572
+573
+574
+575
+576
+577
+578
+579
+580
+581
+
+E THICS AND R EPRODUCIBILITY S TATEMENT
+
+To ensure reproducibility, we will open-source the FlashSampling algorithm along with all related
+code and experimental details upon publication. The publicly available datasets and detailed usage
+instructions are also provided to help other researchers replicate our results and apply the methodology to their own projects.
+
+R EFERENCES
+Christophe Andrieu, Arnaud Doucet, and Roman Holenstein. Particle markov chain monte carlo
+methods. Journal of the Royal Statistical Society Series B: Statistical Methodology, 72(3):269–
+342, 2010.
+David M Blei, Alp Kucukelbir, and Jon D McAuliffe. Variational inference: A review for statisticians. Journal of the American statistical Association, 112(518):859–877, 2017.
+Tom B. Brown, Benjamin Mann, Nick Ryder, Melanie Subbiah, Jared Kaplan, Prafulla Dhariwal, Arvind Neelakantan, Pranav Shyam, Girish Sastry, Amanda Askell, Sandhini Agarwal,
+Ariel Herbert-Voss, Gretchen Krueger, Tom Henighan, Rewon Child, Aditya Ramesh, Daniel M.
+Ziegler, Jeffrey Wu, Clemens Winter, Christopher Hesse, Mark Chen, Eric Sigler, Mateusz Litwin,
+Scott Gray, Benjamin Chess, Jack Clark, Christopher Berner, Sam McCandlish, Alec Radford,
+Ilya Sutskever, and Dario Amodei. Language models are few-shot learners, 2020.
+Tianqi Chen, Emily Fox, and Carlos Guestrin. Stochastic gradient hamiltonian monte carlo. In
+International conference on machine learning, pp. 1683–1691. PMLR, 2014.
+JEAN-MARIE CORNUET, JEAN-MICHEL MARIN, Antonietta Mira, and Christian P Robert.
+Adaptive multiple importance sampling. Scandinavian Journal of Statistics, 39(4):798–812,
+2012.
+Tri Dao. Flashattention-2: Faster attention with better parallelism and work partitioning. arXiv
+preprint arXiv:2307.08691, 2023.
+Tri Dao, Dan Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. Flashattention: Fast and memoryefficient exact attention with io-awareness. Advances in Neural Information Processing Systems,
+35:16344–16359, 2022.
+A Doucet. Sequential monte carlo methods in practice, 2001.
+
+582
+583
+584
+585
+586
+587
+
+Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Abhishek Kadian, Ahmad Al-Dahle, Aiesha
+Letman, Akhil Mathur, Alan Schelten, Amy Yang, Angela Fan, et al. The llama 3 herd of models.
+arXiv preprint arXiv:2407.21783, 2024.
+
+588
+589
+590
+591
+592
+593
+
+Pavlos S Efraimidis. Weighted random sampling over data streams. Algorithms, Probability, Networks, and Games: Scientific Papers and Essays Dedicated to Paul G. Spirakis on the Occasion
+of His 60th Birthday, pp. 183–195, 2015.
+
+David J Earl and Michael W Deem. Parallel tempering: Theory, applications, and new perspectives.
+Physical Chemistry Chemical Physics, 7(23):3910–3916, 2005.
+
+Dani Gamerman and Hedibert F. Lopes. Markov Chain Monte Carlo: Stochastic Simulation for
+Bayesian Inference, Second Edition. Chapman and Hall/CRC, May 2006. ISBN 9780429183348.
+doi: 10.1201/9781482296426. URL http://dx.doi.org/10.1201/9781482296426.
+11
+
+Under review as a conference paper at ICLR 2025
+
+594
+595
+596
+597
+598
+599
+600
+601
+602
+603
+604
+605
+606
+607
+608
+609
+610
+611
+612
+613
+614
+615
+616
+617
+618
+
+Will Grathwohl, Dami Choi, Yuhuai Wu, Geoffrey Roeder, and David Duvenaud. Backpropagation
+through the void: Optimizing control variates for black-box gradient estimation. arXiv preprint
+arXiv:1711.00123, 2017.
+Matthew D Hoffman, Andrew Gelman, et al. The no-u-turn sampler: adaptively setting path lengths
+in hamiltonian monte carlo. J. Mach. Learn. Res., 15(1):1593–1623, 2014.
+Eric Jang, Shixiang Gu, and Ben Poole. Categorical reparameterization with gumbel-softmax. arXiv
+preprint arXiv:1611.01144, 2016.
+Wouter Kool, Herke Van Hoof, and Max Welling. Stochastic beams and where to find them: The
+gumbel-top-k trick for sampling sequences without replacement. In International Conference on
+Machine Learning, pp. 3499–3508. PMLR, 2019.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph
+Gonzalez, Hao Zhang, and Ion Stoica. Efficient memory management for large language model
+serving with pagedattention. In Proceedings of the 29th Symposium on Operating Systems Principles, pp. 611–626, 2023.
+Benjamin Lefaudeux, Francisco Massa, Diana Liskovich, Wenhan Xiong, Vittorio Caggiano, Sean
+Naren, Min Xu, Jieru Hu, Marta Tintore, Susan Zhang, et al. xformers: A modular and hackable
+transformer modelling library, 2022.
+Yanbo Liang, Horace He, Michael Gschwind, Nikita Shulga, HDCharles, Artem Bolgar,
+Ma Mingfei, Sergii Dymchenko, cpuhrsch, Jerry Zhang, Zhiqing Sun, Yifu Wang, Vik Paruchuri,
+Srinivas Billa, Michael Feil, MDK8888, Keren Zhou, Ikko Eltociear Ashimine, Hunt Zhan, and
+Hugo Sousa. pytorch-labs/gpt-fast. 9 2024. URL https://github.com/pytorch-labs/
+gpt-fast.
+
+619
+620
+621
+622
+623
+624
+
+Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Alex Graves, Ioannis Antonoglou, Daan Wierstra, and Martin Riedmiller. Playing atari with deep reinforcement learning, 2013.
+
+625
+626
+627
+628
+629
+630
+
+Radford M Neal. Mcmc using hamiltonian dynamics. arXiv preprint arXiv:1206.1901, 2012.
+
+Volodymyr Mnih, Koray Kavukcuoglu, David Silver, Andrei A Rusu, Joel Veness, Marc G Bellemare, Alex Graves, Martin Riedmiller, Andreas K Fidjeland, Georg Ostrovski, et al. Human-level
+control through deep reinforcement learning. nature, 518(7540):529–533, 2015.
+
+Von Neumann. Various techniques used in connection with random digits. Notes by GE Forsythe,
+pp. 36–38, 1951.
+Zhen Qin, Weigao Sun, Dong Li, Xuyang Shen, Weixuan Sun, and Yiran Zhong. Lightning
+attention-2: A free lunch for handling unlimited sequence lengths in large language models. arXiv
+preprint arXiv:2401.04658, 2024.
+
+631
+632
+633
+634
+635
+
+Markus N Rabe and Charles Staats. Self-attention does not need o(n2 ) memory. arXiv preprint
+arXiv:2112.05682, 2021.
+
+636
+637
+638
+639
+640
+641
+
+George Tucker, Andriy Mnih, Chris J Maddison, John Lawson, and Jascha Sohl-Dickstein. Rebar:
+Low-variance, unbiased gradient estimates for discrete latent variable models. Advances in Neural
+Information Processing Systems, 30, 2017.
+
+642
+643
+644
+645
+646
+647
+
+I Sutskever. Sequence to sequence learning with neural networks. arXiv preprint arXiv:1409.3215,
+2014.
+
+Aaron van den Oord, Oriol Vinyals, and Koray Kavukcuoglu. Neural discrete representation learning, 2017.
+Max Welling and Yee W Teh. Bayesian learning via stochastic gradient langevin dynamics. In
+Proceedings of the 28th international conference on machine learning (ICML-11), pp. 681–688.
+Citeseer, 2011.
+Songlin Yang, Bailin Wang, Yikang Shen, Rameswar Panda, and Yoon Kim. Gated linear attention
+transformers with hardware-efficient training. arXiv preprint arXiv:2312.06635, 2023.
+12
+
+Under review as a conference paper at ICLR 2025
+
+648
+649
+650
+651
+652
+653
+654
+655
+656
+657
+658
+659
+660
+661
+
+Songlin Yang, Bailin Wang, Yu Zhang, Yikang Shen, and Yoon Kim. Parallelizing linear transformers with the delta rule over sequence length. arXiv preprint arXiv:2406.06484, 2024.
+Lantao Yu, Weinan Zhang, Jun Wang, and Yong Yu. Seqgan: Sequence generative adversarial nets
+with policy gradient, 2016.
+Yu Zhang, Songlin Yang, Ruijie Zhu, Yue Zhang, Leyang Cui, Yiqiao Wang, Bolun Wang, Freda
+Shi, Bailin Wang, Wei Bi, et al. Gated slot attention for efficient linear-time sequence modeling.
+arXiv preprint arXiv:2409.07146, 2024.
+Barret Zoph and Quoc Le. Neural architecture search with reinforcement learning. In International
+Conference on Learning Representations, 2017. URL https://openreview.net/forum?
+id=r1Ue8Hcxg.
+
+662
+663
+664
+665
+666
+667
+668
+669
+670
+671
+672
+673
+674
+675
+676
+677
+678
+679
+680
+681
+682
+683
+684
+685
+686
+687
+688
+689
+690
+691
+692
+693
+694
+695
+696
+697
+698
+699
+700
+701
+
+13
+
+
